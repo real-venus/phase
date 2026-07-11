@@ -510,6 +510,7 @@ fn redundancy_delta(
         | Effect::GrantCastingPermission { .. }
         | Effect::ChooseFromZone { .. }
         | Effect::ForEachCategoryExile { .. }
+        | Effect::ForEachCategoryPutCounter { .. }
         | Effect::ChooseObjectsIntoTrackedSet { .. }
         | Effect::ChooseAndSacrificeRest { .. }
         | Effect::EachPlayerCopyChosen { .. }

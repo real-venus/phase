@@ -5729,6 +5729,75 @@ fn try_parse_for_each_category_exile(tp: TextPair<'_>) -> Option<ParsedEffectCla
     })
 }
 
+/// CR 105.1 + CR 122.1 + CR 608.2c: "for each color, put a +1/+1 counter on a
+/// Dragon you control of that color" (Call the Spirit Dragons). The
+/// counter-placement sibling of [`try_parse_for_each_category_exile`]: composes
+/// the category axis (color / card type) with a counter noun and a base target
+/// filter, then REQUIRES the trailing "of that <member-noun>" agreement clause —
+/// so a plain "put a +1/+1 counter on a Dragon you control" (no per-member
+/// binding) does NOT match this iterator. Emits
+/// [`Effect::ForEachCategoryPutCounter`].
+fn try_parse_for_each_category_put_counter(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
+    type E<'a> = OracleError<'a>;
+    use crate::types::ability::IterationCategory;
+
+    let (rest, _) = tag::<_, _, E>("for each ").parse(tp.lower).ok()?;
+    // CR 105.1 / CR 205.2a: the iterated category axis.
+    let (rest, category) = alt((
+        value(
+            IterationCategory::Color,
+            (tag::<_, _, E>("color"), opt(tag::<_, _, E>("s"))),
+        ),
+        value(
+            IterationCategory::CardType,
+            (tag::<_, _, E>("card type"), opt(tag::<_, _, E>("s"))),
+        ),
+    ))
+    .parse(rest)
+    .ok()?;
+    let (rest, _) = tag::<_, _, E>(", put ").parse(rest).ok()?;
+
+    // CR 122.1: the counter noun — "a +1/+1 counter" → count + counter type.
+    let (count, rest) = parse_count_expr(rest)?;
+    let rest = rest.trim_start();
+    let (rest, counter_type) = nom_primitives::parse_counter_type_typed(rest).ok()?;
+    let (rest, _) = alt((tag::<_, _, E>(" counters"), tag(" counter")))
+        .parse(rest)
+        .ok()?;
+
+    let (rest, _) = tag::<_, _, E>(" on ").parse(rest).ok()?;
+    // The base candidate filter ("a Dragon you control"). NOT a stack target —
+    // read by the resolver to build each per-member candidate pool.
+    let (filter, rest) = parse_target(rest);
+
+    // CR 608.2c: trailing "of that <member-noun>" agreement binds the placement to
+    // the iterated member; without it this is not a category iteration.
+    let (rest, _) = tag::<_, _, E>(" of that ").parse(rest).ok()?;
+    let (rest, _) = match category {
+        IterationCategory::Color => tag::<_, _, E>("color").parse(rest).ok()?,
+        IterationCategory::CardType => tag::<_, _, E>("type").parse(rest).ok()?,
+    };
+    if !rest.trim().is_empty() {
+        return None;
+    }
+
+    Some(ParsedEffectClause {
+        effect: Effect::ForEachCategoryPutCounter {
+            category,
+            counter_type,
+            count,
+            filter,
+        },
+        duration: None,
+        sub_ability: None,
+        distribute: None,
+        multi_target: None,
+        condition: None,
+        optional: false,
+        unless_pay: None,
+    })
+}
+
 fn unless_rider_defers_to_body_parser(text: &str) -> bool {
     let lower = text.to_lowercase();
     let Some((before_unless, _, after_unless)) =
@@ -7244,6 +7313,10 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     // for-each path; the `DistinctCounterKindsAmong` iteration source has already
     // been lifted onto the parent's `repeat_for` by `strip_for_each_prefix`.
     if let Some(clause) = try_parse_for_each_counter_kind_choice(tp) {
+        return clause;
+    }
+
+    if let Some(clause) = try_parse_for_each_category_put_counter(tp) {
         return clause;
     }
 

@@ -11462,6 +11462,38 @@ pub enum Effect {
         #[serde(default = "default_true")]
         up_to: bool,
     },
+    /// CR 105.1 + CR 122.1 + CR 608.2c: For each member of a fixed category (the
+    /// five colors), put `count` `counter_type` counters on one battlefield
+    /// permanent matching `filter` that also *is* that member — "for each color,
+    /// put a +1/+1 counter on a Dragon you control of that color" (Call the
+    /// Spirit Dragons). The counter-placement sibling of [`Effect::ForEachCategoryExile`]:
+    /// distinct on its candidate-source axis (battlefield permanents you control,
+    /// not a revealed/exiled card pool) and its action axis (place counters, not
+    /// zone-move). Each per-member pick is MANDATORY when a matching permanent of
+    /// that member exists (CR 608.2c "follow its instructions"), so unlike the
+    /// "you may exile" iterator there is no per-member `up_to`; when two or more
+    /// permanents share the member the controller chooses one (CR 608.2d). Every
+    /// permanent that receives a counter this way accumulates (deduplicated) into
+    /// the resolution chain's tracked object set so a downstream "this way" count
+    /// (`QuantityRef::FilteredTrackedSetSize`) reads the DISTINCT permanents — a
+    /// multi-color permanent that gets a counter for two colors is counted once.
+    ///
+    // TODO(class): unify with `ForEachCategoryExile` under a per-member effect
+    // wrapper (category iterator + swappable per-member action) once a third
+    // category-iteration action type appears.
+    ForEachCategoryPutCounter {
+        /// CR 105.1: Which fixed category's members are iterated (WUBRG colors).
+        category: IterationCategory,
+        /// CR 122.1: The kind of counter placed on each chosen permanent.
+        counter_type: CounterType,
+        /// CR 122.1: How many counters of `counter_type` to place per member.
+        #[serde(default = "default_quantity_one")]
+        count: QuantityExpr,
+        /// The base candidate filter each member restricts ("a Dragon you
+        /// control"); the per-member color is AND-combined onto it at resolution.
+        #[serde(default = "default_target_filter_any")]
+        filter: TargetFilter,
+    },
     /// CR 603.7e: An affected-player-chosen battlefield permanent set, written
     /// into the chain's tracked object set so downstream effects ("pay {N} for
     /// each ... chosen this way", "untap those creatures") reference the exact
@@ -13563,6 +13595,10 @@ impl Effect {
             | Effect::ReturnAsAura { .. }
             | Effect::ChooseFromZone { .. }
             | Effect::ForEachCategoryExile { .. }
+            // CR 122.1 + CR 608.2c: the per-member Dragon is CHOSEN at resolution
+            // (`WaitingFor::ChooseFromZoneChoice`), not a stack-push target — the
+            // `filter` is read directly by the resolver. No target slot.
+            | Effect::ForEachCategoryPutCounter { .. }
             | Effect::ChooseAndSacrificeRest { .. }
             | Effect::EachPlayerCopyChosen { .. }
             | Effect::GainEnergy { .. }
@@ -13759,6 +13795,8 @@ impl Effect {
             | Effect::CreateTokenCopyFromPool { count, .. }
             | Effect::PutCounter { count, .. }
             | Effect::PutCounterAll { count, .. }
+            // CR 122.1: per-member counter count for the category iterator.
+            | Effect::ForEachCategoryPutCounter { count, .. }
             // CR 122.1 + CR 122.6: how many counters of the chosen kind to add.
             | Effect::PutChosenCounter { count, .. }
             | Effect::Discard { count, .. }
@@ -14011,6 +14049,8 @@ impl Effect {
             | Effect::CreateTokenCopyFromPool { count, .. }
             | Effect::PutCounter { count, .. }
             | Effect::PutCounterAll { count, .. }
+            // CR 122.1: per-member counter count for the category iterator.
+            | Effect::ForEachCategoryPutCounter { count, .. }
             // CR 122.1 + CR 122.6: how many counters of the chosen kind to add.
             | Effect::PutChosenCounter { count, .. }
             | Effect::Discard { count, .. }
@@ -14414,6 +14454,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::ChooseFromZone { .. } => "ChooseFromZone",
         Effect::RememberCard { .. } => "RememberCard",
         Effect::ForEachCategoryExile { .. } => "ForEachCategoryExile",
+        Effect::ForEachCategoryPutCounter { .. } => "ForEachCategoryPutCounter",
         Effect::ChooseObjectsIntoTrackedSet { .. } => "ChooseObjectsIntoTrackedSet",
         Effect::ChooseAndSacrificeRest { .. } => "ChooseAndSacrificeRest",
         Effect::EachPlayerCopyChosen { .. } => "EachPlayerCopyChosen",
@@ -14925,6 +14966,10 @@ impl From<&Effect> for EffectKind {
             // The per-member iteration parks `ChooseFromZoneChoice` prompts and
             // emits `ChooseFromZone` resolution events; it shares the kind.
             Effect::ForEachCategoryExile { .. } => EffectKind::ChooseFromZone,
+            // Shares the `ChooseFromZone` iteration machinery (parks
+            // `ChooseFromZoneChoice` per member, emits `ChooseFromZone` resolution
+            // events), so it reports the same kind as its exile sibling.
+            Effect::ForEachCategoryPutCounter { .. } => EffectKind::ChooseFromZone,
             Effect::ChooseObjectsIntoTrackedSet { .. } => EffectKind::ChooseObjectsIntoTrackedSet,
             Effect::ChooseCounterKind { .. } => EffectKind::ChooseCounterKind,
             Effect::PutChosenCounter { .. } => EffectKind::PutChosenCounter,

@@ -140,32 +140,101 @@ pub fn resolve_for_each_category(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let category = match &ability.effect {
-        Effect::ForEachCategoryExile { category, .. } => *category,
-        _ => {
-            return Err(EffectError::MissingParam(
-                "ForEachCategoryExile".to_string(),
-            ))
-        }
-    };
     // CR 608.2c: Capture the revealed/exiled pool once; every member filters
     // this snapshot (minus already-exiled cards), not the mutating chain set.
+    // Captured BEFORE `start_for_each_category` rebinds the chain set, because
+    // the exile pool IS the chain's current tracked set.
     let pool = resolve_category_pool(state, ability);
-    // CR 603.7 + CR 608.2c: Rebind the chain tracked set to a FRESH, initially
-    // EMPTY "cards exiled this way" set BEFORE prompting any member. The captured
-    // `pool` snapshot (the revealed cards) drives member filtering; the chain set
-    // now exclusively accumulates the cards actually exiled across the members.
-    // Without this, a downstream "from among them" / "you may cast a spell from
-    // among the exiled cards" continuation would read whatever the chain set
-    // pointed at when the iteration started (the producer's revealed pool) on the
-    // all-decline path — so it would see cards that were never exiled this way
-    // (Portent of Calamity: "if you exiled four or more cards this way"). Because
-    // the chain set now starts as the exiled set, every later pick EXTENDS it
-    // (`accumulated = true`).
+    start_for_each_category(state, ability, pool, events)
+}
+
+/// CR 105.1 + CR 122.1 + CR 608.2c: Resolve an `Effect::ForEachCategoryPutCounter`
+/// ("for each color, put a +1/+1 counter on a Dragon you control of that color").
+/// Shares the category-iteration skeleton with `resolve_for_each_category`; the
+/// only differences are the candidate pool (battlefield permanents matching the
+/// effect's `filter`, not a revealed/exiled card pool) and the per-member action
+/// (place counters, applied in `drain_pending_per_category_zone_choice`). Every
+/// permanent that receives a counter accumulates DEDUPLICATED into the chain's
+/// tracked set so a downstream "put +1/+1 counters on N Dragons this way" count
+/// reads the distinct permanents.
+pub fn resolve_for_each_category_put_counter(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EffectError> {
+    let pool = resolve_put_counter_category_pool(state, ability);
+    start_for_each_category(state, ability, pool, events)
+}
+
+/// CR 608.2c + CR 105.1: Shared entry for both category iterators.
+/// Rebinds the chain tracked set to a FRESH, initially EMPTY "affected this way"
+/// set BEFORE prompting any member (so a downstream "this way" continuation reads
+/// exactly the objects affected across the members, never the producer's original
+/// pool — matching Portent of Calamity's "if you exiled four or more cards this
+/// way" and Call the Spirit Dragons' "if you put +1/+1 counters on five Dragons
+/// this way"), then prompts the first eligible member. `pool` is captured by the
+/// caller because the exile pool aliases the chain set this rebind overwrites.
+fn start_for_each_category(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    pool: Vec<ObjectId>,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EffectError> {
+    let category = category_of(&ability.effect).ok_or_else(|| {
+        EffectError::MissingParam("ForEachCategory{Exile,PutCounter}".to_string())
+    })?;
     super::publish_fresh_tracked_set(state, Vec::new());
     // CR 105.1 / CR 205.2a: the ordered per-member candidate filters.
     let member_filters = category.member_filters();
     prompt_next_category_member(state, ability, &pool, member_filters, events)
+}
+
+/// CR 105.1 / CR 205.2a: The iterated category for either category-iteration effect.
+fn category_of(effect: &Effect) -> Option<crate::types::ability::IterationCategory> {
+    match effect {
+        Effect::ForEachCategoryExile { category, .. }
+        | Effect::ForEachCategoryPutCounter { category, .. } => Some(*category),
+        _ => None,
+    }
+}
+
+/// CR 608.2c: Per-member prompt parameters `(zone, chooser, up_to)` for either
+/// category-iteration effect. For `ForEachCategoryPutCounter` the candidate zone
+/// is always the battlefield, the controller chooses (CR 608.2d picks among
+/// multiple permanents of that color), and each pick is MANDATORY when a matching
+/// permanent exists (`up_to = false`) — "put a +1/+1 counter" is not "you may".
+fn category_prompt_params(effect: &Effect) -> Option<(Zone, Chooser, bool)> {
+    match effect {
+        Effect::ForEachCategoryExile {
+            zone,
+            chooser,
+            up_to,
+            ..
+        } => Some((*zone, *chooser, *up_to)),
+        Effect::ForEachCategoryPutCounter { .. } => {
+            Some((Zone::Battlefield, Chooser::Controller, false))
+        }
+        _ => None,
+    }
+}
+
+/// CR 122.1 + CR 608.2c: Candidate pool for `Effect::ForEachCategoryPutCounter` —
+/// every battlefield permanent matching the effect's base `filter` ("a Dragon you
+/// control"). The per-member color restriction is AND-applied later by
+/// `filter_category_pool`. "You control" inside the filter resolves against the
+/// ability's controller via `FilterContext::from_ability`.
+fn resolve_put_counter_category_pool(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> Vec<ObjectId> {
+    let Effect::ForEachCategoryPutCounter { filter, .. } = &ability.effect else {
+        return Vec::new();
+    };
+    let filter_ctx = FilterContext::from_ability(ability);
+    crate::game::targeting::zone_object_ids(state, Zone::Battlefield)
+        .into_iter()
+        .filter(|id| matches_target_filter(state, *id, filter, &filter_ctx))
+        .collect()
 }
 
 /// CR 608.2c: Park the next category member's `ChooseFromZoneChoice` prompt for
@@ -181,19 +250,9 @@ fn prompt_next_category_member(
     mut remaining_member_filters: Vec<TargetFilter>,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let (zone, chooser, up_to) = match &ability.effect {
-        Effect::ForEachCategoryExile {
-            zone,
-            chooser,
-            up_to,
-            ..
-        } => (*zone, *chooser, *up_to),
-        _ => {
-            return Err(EffectError::MissingParam(
-                "ForEachCategoryExile".to_string(),
-            ))
-        }
-    };
+    let (zone, chooser, up_to) = category_prompt_params(&ability.effect).ok_or_else(|| {
+        EffectError::MissingParam("ForEachCategory{Exile,PutCounter}".to_string())
+    })?;
 
     while !remaining_member_filters.is_empty() {
         let member_filter = remaining_member_filters.remove(0);
@@ -252,20 +311,55 @@ pub(crate) fn drain_pending_per_category_zone_choice(
         remaining_member_filters,
     } = pending;
 
-    // CR 608.2c: "you may EXILE a card of that color/type" — the per-member
-    // action is the exile itself, so the chosen card moves to Exile now, then
-    // EXTENDS the chain tracked set ("the cards exiled this way") for a
-    // downstream "from among them" / "the rest" clause. The chain set was
-    // rebound to a fresh EMPTY set at iteration start (`resolve_for_each_category`),
-    // so an all-decline iteration correctly leaves it empty — a continuation
-    // such as Portent's "if you exiled four or more cards this way" never sees
-    // the producer's revealed pool. An empty pick (the player declined this
-    // member) extends by nothing.
-    for &card_id in chosen {
-        crate::game::zones::move_to_zone(state, card_id, Zone::Exile, events);
-    }
-    if !chosen.is_empty() {
-        super::publish_tracked_set(state, chosen.to_vec());
+    // CR 608.2c: The per-member action depends on the effect. The chosen object
+    // then EXTENDS the chain tracked set ("affected this way") for a downstream
+    // "this way" clause. The chain set was rebound to a fresh EMPTY set at
+    // iteration start (`start_for_each_category`), so an all-decline / no-op
+    // iteration correctly leaves it empty. An empty pick (declined member)
+    // extends by nothing.
+    match &ability.effect {
+        // CR 122.1: "put a +1/+1 counter on a Dragon you control of that color" —
+        // place `count` counters on the chosen permanent. The tracked-set publish
+        // is DEDUPLICATED against the accumulated chain set so a multi-color
+        // permanent chosen for two colors is counted once by a downstream
+        // "N Dragons this way" tally (CR 608.2c identity).
+        Effect::ForEachCategoryPutCounter {
+            counter_type,
+            count,
+            ..
+        } => {
+            let placement_count =
+                crate::game::quantity::resolve_quantity_with_targets(state, count, &ability).max(0)
+                    as u32;
+            for &object_id in chosen {
+                crate::game::effects::counters::add_counter_with_replacement(
+                    state,
+                    ability.controller,
+                    object_id,
+                    counter_type.clone(),
+                    placement_count,
+                    events,
+                );
+            }
+            let fresh: Vec<ObjectId> = chosen
+                .iter()
+                .copied()
+                .filter(|id| !chain_tracked_set_contains(state, *id))
+                .collect();
+            if !fresh.is_empty() {
+                super::publish_tracked_set(state, fresh);
+            }
+        }
+        // CR 608.2c: "you may EXILE a card of that color/type" — the per-member
+        // action is the exile itself (Portent of Calamity, Sanar's Vivid).
+        _ => {
+            for &card_id in chosen {
+                crate::game::zones::move_to_zone(state, card_id, Zone::Exile, events);
+            }
+            if !chosen.is_empty() {
+                super::publish_tracked_set(state, chosen.to_vec());
+            }
+        }
     }
 
     let _ = prompt_next_category_member(state, &ability, &pool, remaining_member_filters, events);
@@ -601,6 +695,17 @@ fn chain_tracked_set_cards(state: &GameState) -> Option<Vec<ObjectId>> {
     let chain_id = state.chain_tracked_set_id?;
     let cards = state.tracked_object_sets.get(&chain_id)?;
     (!cards.is_empty()).then(|| cards.clone())
+}
+
+/// CR 608.2c: Whether the resolution chain's tracked set already contains `id`.
+/// Used by the `ForEachCategoryPutCounter` drain to deduplicate a permanent that
+/// receives a counter for more than one color, so a downstream "N Dragons this
+/// way" count tallies distinct permanents.
+fn chain_tracked_set_contains(state: &GameState, id: ObjectId) -> bool {
+    state
+        .chain_tracked_set_id
+        .and_then(|chain_id| state.tracked_object_sets.get(&chain_id))
+        .is_some_and(|ids| ids.contains(&id))
 }
 
 fn collect_direct_zone_cards(
@@ -2274,6 +2379,290 @@ mod tests {
         assert!(
             !eval_after_exiling(3),
             "exiling only three cards this way must keep the free-cast gate closed"
+        );
+    }
+
+    /// Create a Dragon permanent on the battlefield controlled by `PlayerId(0)`
+    /// with the given colors (both base and derived card types so a `Subtype`
+    /// filter matches whether or not layers have been flushed).
+    fn make_battlefield_dragon(
+        state: &mut GameState,
+        card_id: u64,
+        name: &str,
+        colors: &[crate::types::mana::ManaColor],
+    ) -> ObjectId {
+        use crate::types::card_type::CoreType;
+        let id = create_object(
+            state,
+            CardId(card_id),
+            PlayerId(0),
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.color = colors.to_vec();
+        obj.card_types.core_types = vec![CoreType::Creature];
+        obj.base_card_types.core_types = vec![CoreType::Creature];
+        obj.card_types.subtypes = vec!["Dragon".to_string()];
+        obj.base_card_types.subtypes = vec!["Dragon".to_string()];
+        id
+    }
+
+    /// Build the Call the Spirit Dragons upkeep ability: the
+    /// `ForEachCategoryPutCounter` counter iterator with a `WinTheGame`
+    /// sub-ability gated on `FilteredTrackedSetSize{Dragon} >= 5`.
+    fn spirit_dragons_ability(source: ObjectId, controller: PlayerId) -> ResolvedAbility {
+        use crate::types::ability::{
+            AbilityCondition, Comparator, ControllerRef, IterationCategory, QuantityExpr,
+            QuantityRef,
+        };
+        let dragon = |controller: Option<ControllerRef>| {
+            TargetFilter::Typed(TypedFilter {
+                type_filters: vec![TypeFilter::Subtype("Dragon".to_string())],
+                controller,
+                properties: vec![],
+            })
+        };
+        let win = ResolvedAbility {
+            condition: Some(AbilityCondition::QuantityCheck {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::FilteredTrackedSetSize {
+                        filter: Box::new(dragon(None)),
+                        caused_by: None,
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 5 },
+            }),
+            ..ResolvedAbility::new(
+                Effect::WinTheGame { target: None },
+                vec![],
+                source,
+                controller,
+            )
+        };
+        ResolvedAbility {
+            sub_ability: Some(Box::new(win)),
+            ..ResolvedAbility::new(
+                Effect::ForEachCategoryPutCounter {
+                    category: IterationCategory::Color,
+                    counter_type: CounterType::Plus1Plus1,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    filter: dragon(Some(ControllerRef::You)),
+                },
+                vec![],
+                source,
+                controller,
+            )
+        }
+    }
+
+    /// Drive every parked per-member `ChooseFromZoneChoice` by selecting the
+    /// offered candidate(s) (each color offers exactly one Dragon in these
+    /// fixtures, and the pick is mandatory: count 1).
+    fn resolve_all_member_choices(state: &mut GameState) {
+        use crate::types::actions::GameAction;
+        while let WaitingFor::ChooseFromZoneChoice { cards, .. } = &state.waiting_for {
+            let pick = cards.clone();
+            crate::game::engine::apply(state, PlayerId(0), GameAction::SelectCards { cards: pick })
+                .unwrap();
+        }
+    }
+
+    fn plus1_counters(state: &GameState, id: ObjectId) -> u32 {
+        state
+            .objects
+            .get(&id)
+            .and_then(|o| o.counters.get(&CounterType::Plus1Plus1).copied())
+            .unwrap_or(0)
+    }
+
+    /// CR 105.1 + CR 122.1 + CR 104.2b: five mono-color Dragons (WUBRG) — the
+    /// upkeep trigger places one +1/+1 counter on each, publishes all FIVE into
+    /// the chain tracked set, and the gated `WinTheGame` fires (five distinct
+    /// Dragons `>= 5`), eliminating the opponent. Reverting the win gate (or the
+    /// counter iterator) breaks the `is_alive` flip.
+    #[test]
+    fn spirit_dragons_five_colors_wins_the_game() {
+        use crate::types::mana::ManaColor;
+        let mut state = GameState::new_two_player(7);
+        let source = create_object(
+            &mut state,
+            CardId(99),
+            PlayerId(0),
+            "Call the Spirit Dragons".to_string(),
+            Zone::Battlefield,
+        );
+        let dragons = [
+            make_battlefield_dragon(&mut state, 1, "W Dragon", &[ManaColor::White]),
+            make_battlefield_dragon(&mut state, 2, "U Dragon", &[ManaColor::Blue]),
+            make_battlefield_dragon(&mut state, 3, "B Dragon", &[ManaColor::Black]),
+            make_battlefield_dragon(&mut state, 4, "R Dragon", &[ManaColor::Red]),
+            make_battlefield_dragon(&mut state, 5, "G Dragon", &[ManaColor::Green]),
+        ];
+
+        let ability = spirit_dragons_ability(source, PlayerId(0));
+        let mut events = Vec::new();
+        super::super::resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        resolve_all_member_choices(&mut state);
+
+        for id in dragons {
+            assert_eq!(
+                plus1_counters(&state, id),
+                1,
+                "each Dragon must receive exactly one +1/+1 counter"
+            );
+        }
+        assert!(
+            !crate::game::players::is_alive(&state, PlayerId(1)),
+            "putting counters on five distinct Dragons must win the game (opponent eliminated)"
+        );
+    }
+
+    /// CR 105.1 + CR 104.2b: only four colors are represented, so only four
+    /// Dragons get a counter and the tracked set holds four — one short of the
+    /// win. The counters ARE placed (positive reach-guard so the no-win assertion
+    /// is not vacuous) but the opponent stays alive.
+    #[test]
+    fn spirit_dragons_four_colors_does_not_win() {
+        use crate::types::mana::ManaColor;
+        let mut state = GameState::new_two_player(7);
+        let source = create_object(
+            &mut state,
+            CardId(99),
+            PlayerId(0),
+            "Call the Spirit Dragons".to_string(),
+            Zone::Battlefield,
+        );
+        let dragons = [
+            make_battlefield_dragon(&mut state, 1, "W Dragon", &[ManaColor::White]),
+            make_battlefield_dragon(&mut state, 2, "U Dragon", &[ManaColor::Blue]),
+            make_battlefield_dragon(&mut state, 3, "B Dragon", &[ManaColor::Black]),
+            make_battlefield_dragon(&mut state, 4, "R Dragon", &[ManaColor::Red]),
+        ];
+
+        let ability = spirit_dragons_ability(source, PlayerId(0));
+        let mut events = Vec::new();
+        super::super::resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        resolve_all_member_choices(&mut state);
+
+        // Positive reach-guard: the counters were actually placed on all four.
+        for id in dragons {
+            assert_eq!(
+                plus1_counters(&state, id),
+                1,
+                "each of the four Dragons gets a counter"
+            );
+        }
+        let tracked = state
+            .chain_tracked_set_id
+            .and_then(|cid| state.tracked_object_sets.get(&cid))
+            .map(|s| s.len())
+            .unwrap_or(0);
+        assert_eq!(
+            tracked, 4,
+            "only four distinct Dragons were counter'd this way"
+        );
+        assert!(
+            crate::game::players::is_alive(&state, PlayerId(1)),
+            "four Dragons is short of five — the game must NOT be won"
+        );
+    }
+
+    /// CR 608.2c identity + CR 105.1: a two-color (WU) Dragon plus B/R/G Dragons
+    /// covers all five colors with only FOUR distinct permanents. The WU Dragon
+    /// receives TWO counters (one for white, one for blue) but is counted ONCE in
+    /// the "this way" tracked set, so the distinct count is four and the win does
+    /// NOT fire. This discriminates the dedup: without it the WU Dragon would be
+    /// double-counted to five and wrongly win.
+    #[test]
+    fn spirit_dragons_multicolor_dragon_counted_once() {
+        use crate::types::mana::ManaColor;
+        let mut state = GameState::new_two_player(7);
+        let source = create_object(
+            &mut state,
+            CardId(99),
+            PlayerId(0),
+            "Call the Spirit Dragons".to_string(),
+            Zone::Battlefield,
+        );
+        let wu = make_battlefield_dragon(
+            &mut state,
+            1,
+            "WU Dragon",
+            &[ManaColor::White, ManaColor::Blue],
+        );
+        let b = make_battlefield_dragon(&mut state, 2, "B Dragon", &[ManaColor::Black]);
+        let r = make_battlefield_dragon(&mut state, 3, "R Dragon", &[ManaColor::Red]);
+        let g = make_battlefield_dragon(&mut state, 4, "G Dragon", &[ManaColor::Green]);
+
+        let ability = spirit_dragons_ability(source, PlayerId(0));
+        let mut events = Vec::new();
+        super::super::resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        resolve_all_member_choices(&mut state);
+
+        assert_eq!(
+            plus1_counters(&state, wu),
+            2,
+            "the WU Dragon is chosen for both the white and the blue member → two counters"
+        );
+        for id in [b, r, g] {
+            assert_eq!(
+                plus1_counters(&state, id),
+                1,
+                "each mono-color Dragon gets one counter"
+            );
+        }
+        let tracked = state
+            .chain_tracked_set_id
+            .and_then(|cid| state.tracked_object_sets.get(&cid))
+            .map(|s| s.len())
+            .unwrap_or(0);
+        assert_eq!(
+            tracked, 4,
+            "the WU Dragon is deduplicated — four DISTINCT Dragons received counters this way"
+        );
+        assert!(
+            crate::game::players::is_alive(&state, PlayerId(1)),
+            "four distinct Dragons is short of five — the game must NOT be won"
+        );
+    }
+
+    /// CR 611.2 + CR 702.12a + CR 701.7b: clause 1's granted indestructible still
+    /// works after this change — a Dragon with Indestructible cannot be destroyed.
+    /// Pairs with the parser regression `call_the_spirit_dragons_indestructible_static_unchanged`
+    /// (which proves clause 1 grants the keyword): here the granted keyword's
+    /// runtime effect is exercised through the real destroy path.
+    #[test]
+    fn spirit_dragons_indestructible_prevents_destruction() {
+        use crate::types::ability::TargetRef;
+        use crate::types::keywords::Keyword;
+        use crate::types::mana::ManaColor;
+        let mut state = GameState::new_two_player(7);
+        let dragon = make_battlefield_dragon(&mut state, 1, "Guarded Dragon", &[ManaColor::Red]);
+        state
+            .objects
+            .get_mut(&dragon)
+            .unwrap()
+            .keywords
+            .push(Keyword::Indestructible);
+
+        let ability = ResolvedAbility::new(
+            Effect::Destroy {
+                target: TargetFilter::Any,
+                cant_regenerate: false,
+            },
+            vec![TargetRef::Object(dragon)],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        super::super::destroy::resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.objects.get(&dragon).unwrap().zone,
+            Zone::Battlefield,
+            "an indestructible Dragon must survive a Destroy"
         );
     }
 

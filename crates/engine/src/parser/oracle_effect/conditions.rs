@@ -871,6 +871,7 @@ pub(super) fn strip_if_you_do_conditional(text: &str) -> (Option<AbilityConditio
             nom_cond::parse_you_control_or_returned_this_way_condition(rest)
                 .or_else(|_| nom_cond::parse_you_put_into_hand_this_way_condition(rest))
                 .or_else(|_| nom_cond::parse_you_draw_this_way_condition(rest))
+                .or_else(|_| nom_cond::parse_you_put_counters_on_this_way_condition(rest))
         {
             let body_lower = strip_reflexive_conditional_body_separator(after_clause);
             let offset = text.len() - body_lower.len();

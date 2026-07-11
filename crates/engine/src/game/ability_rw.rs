@@ -2839,6 +2839,12 @@ fn legacy_effect(x: &Effect) -> bool {
             amount: count,
             target,
         } => legacy_quantity_expr(count) || legacy_target_filter(target),
+        // CR 122.1: the category iterator carries a per-member counter `count`
+        // and a base `filter` ("a Dragon you control"), both walked for legacy
+        // tags exactly like the `{ count, target }` group above.
+        Effect::ForEachCategoryPutCounter { count, filter, .. } => {
+            legacy_quantity_expr(count) || legacy_target_filter(filter)
+        }
         // CR 701.58a: `object_source` (Some) names already-chosen objects to cloak —
         // an `Option<TargetFilter>` that can nest a frozen event-context tag, so it is
         // walked here (the shared `{ target, count }` group above cannot).
@@ -5423,6 +5429,9 @@ fn rw_effect(
         | Effect::ChooseAndSacrificeRest { .. }
         | Effect::RememberCard { .. }
         | Effect::ForEachCategoryExile { .. }
+        // CR 122.1: per-member counter placement chosen at resolution — a
+        // conservative read/write profile, like its exile sibling.
+        | Effect::ForEachCategoryPutCounter { .. }
         | Effect::VentureInto { .. }
         | Effect::TakeTheInitiative
         | Effect::RollToVisitAttractions

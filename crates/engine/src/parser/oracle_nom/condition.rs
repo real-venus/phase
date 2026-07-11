@@ -15,6 +15,7 @@ use nom::Parser;
 use super::error::{oracle_err, OracleError, OracleResult};
 use super::primitives::{
     parse_article, parse_color, parse_keyword_name, parse_mana_cost, parse_number,
+    parse_strict_counter_type,
 };
 use super::quantity as nom_quantity;
 use crate::parser::oracle_target::{
@@ -8121,6 +8122,47 @@ pub fn parse_you_control_or_returned_this_way_condition(
 /// X cards … If you draw one or more cards this way, discard two cards"). Reads
 /// the amount moved by the immediately preceding draw effect in the sub-ability
 /// chain via `QuantityRef::PreviousEffectAmount`.
+/// CR 608.2c + CR 122.1: "you put [+1/+1] counters on <number> <type-phrase> this
+/// way" (Call the Spirit Dragons: "If you put +1/+1 counters on five Dragons this
+/// way, you win the game"). Counts the DISTINCT members of the chain's tracked
+/// set — the permanents that received a counter this way, published by the
+/// preceding `Effect::ForEachCategoryPutCounter` — that match the parsed type
+/// phrase, and compares that count `>=` the parsed number. `caused_by: None`
+/// counts every filtered member (the set already holds exactly the "this way"
+/// permanents, so no producer-action discrimination is needed — CR 608.2c
+/// identity). The optional counter-kind qualifier is parsed via
+/// `parse_strict_counter_type` (rejecting the bare noun "counters"), so a card
+/// that names the counter kind ("+1/+1") and one that omits it both parse.
+pub fn parse_you_put_counters_on_this_way_condition(
+    input: &str,
+) -> OracleResult<'_, AbilityCondition> {
+    let (rest, _) = tag("you put ").parse(input)?;
+    let (rest, _) = opt(terminated(parse_strict_counter_type, tag(" "))).parse(rest)?;
+    let (rest, _) = alt((tag("counters"), tag("counter"))).parse(rest)?;
+    let (rest, _) = tag(" on ").parse(rest)?;
+    let (rest, count) = parse_number(rest)?;
+    let (rest, _) = tag(" ").parse(rest)?;
+    // Use the nom-combinator `parse_type_phrase` (oracle_nom::target), which
+    // returns an `OracleResult`, not the tuple-returning `oracle_target` import.
+    let (rest, filter) = super::target::parse_type_phrase(rest)?;
+    let (rest, _) = tag(" this way").parse(rest)?;
+    Ok((
+        rest,
+        AbilityCondition::QuantityCheck {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::FilteredTrackedSetSize {
+                    filter: Box::new(filter),
+                    caused_by: None,
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed {
+                value: count as i32,
+            },
+        },
+    ))
+}
+
 pub fn parse_you_draw_this_way_condition(input: &str) -> OracleResult<'_, AbilityCondition> {
     let (rest, _) = tag("you draw ").parse(input)?;
     let (rest, _) = alt((tag("one or more "), tag("at least one "))).parse(rest)?;

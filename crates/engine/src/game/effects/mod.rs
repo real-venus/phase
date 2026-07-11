@@ -2188,6 +2188,40 @@ fn condition_depends_on_result_object(condition: &AbilityCondition) -> bool {
     }
 }
 
+/// CR 608.2c: Whether a condition reads the resolution chain's tracked object
+/// set (`QuantityRef::FilteredTrackedSetSize` / `TrackedSetSize` /
+/// `TrackedSetAggregate`). Such a count cannot be evaluated while a per-member
+/// category iteration (`ForEachCategoryPutCounter` / `ForEachCategoryExile`) is
+/// still parked on an interactive `ChooseFromZoneChoice` — the set is only fully
+/// populated once EVERY member has resolved. It must therefore be deferred across
+/// the choice(s) alongside the reflexive gates, then re-evaluated once the
+/// iteration completes (Call the Spirit Dragons: "If you put +1/+1 counters on
+/// five Dragons this way, you win the game"). Recurses And/Or/Not like the
+/// sibling predicates. Predicate helper, not rule-implementing code — the CR
+/// annotation lives at the deferral gate.
+fn condition_depends_on_tracked_set(condition: &AbilityCondition) -> bool {
+    fn expr_reads_tracked_set(expr: &QuantityExpr) -> bool {
+        matches!(
+            expr,
+            QuantityExpr::Ref {
+                qty: QuantityRef::FilteredTrackedSetSize { .. }
+                    | QuantityRef::TrackedSetSize
+                    | QuantityRef::TrackedSetAggregate { .. }
+            }
+        )
+    }
+    match condition {
+        AbilityCondition::QuantityCheck { lhs, rhs, .. } => {
+            expr_reads_tracked_set(lhs) || expr_reads_tracked_set(rhs)
+        }
+        AbilityCondition::Not { condition } => condition_depends_on_tracked_set(condition),
+        AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
+            conditions.iter().any(condition_depends_on_tracked_set)
+        }
+        _ => false,
+    }
+}
+
 /// CR 603.12: Whether a sub-ability is a *reflexive* trigger — its "do"
 /// depends on whether the just-prompted action actually occurred during this
 /// resolution. A reflexive sub MUST NOT resolve when the optional parent was
@@ -3336,6 +3370,9 @@ pub fn resolve_effect(
         Effect::RememberCard { .. } => remember_card::resolve(state, ability, events),
         Effect::ForEachCategoryExile { .. } => {
             choose_from_zone::resolve_for_each_category(state, ability, events)
+        }
+        Effect::ForEachCategoryPutCounter { .. } => {
+            choose_from_zone::resolve_for_each_category_put_counter(state, ability, events)
         }
         Effect::ChooseObjectsIntoTrackedSet { .. } => {
             choose_objects_into_tracked_set::resolve(state, ability, events)
@@ -7780,9 +7817,16 @@ fn resolve_chain_body(
             // resolution choice would mis-defer e.g. a `Sacrifice`→`EffectZoneChoice`
             // →`TargetMatchesFilter`-gated sibling, whose completion leaves
             // `cont.chain.targets` empty (it uses the tracked-set/ParentTarget path).
+            // CR 608.2c: a tracked-set count gate ("if you put +1/+1 counters on
+            // five Dragons this way") reads the chain's tracked set, which the
+            // parked per-member category iteration only finishes populating after
+            // its last `ChooseFromZoneChoice` resolves. Defer it across the
+            // choice(s) so it is re-evaluated against the COMPLETE set once the
+            // iteration finishes (Call the Spirit Dragons).
             if waits_for_resolution_choice(&state.waiting_for)
                 && (condition_depends_on_effect_performed(condition)
                     || condition_depends_on_zone_change_this_way(condition)
+                    || condition_depends_on_tracked_set(condition)
                     || matches!(condition, AbilityCondition::WhenYouDo)
                     || (matches!(state.waiting_for, WaitingFor::SearchChoice { .. })
                         && condition_depends_on_result_object(condition)))

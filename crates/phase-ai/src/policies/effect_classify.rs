@@ -65,11 +65,14 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
             }
         }
         // CR 122.1: Counter placement. Sign drives polarity: +1/+1 is beneficial,
-        // -1/-1 is harmful. AddCounter, PutCounter, and PutCounterAll share the
-        // same semantics — the effect puts counters of `counter_type` onto a target.
+        // -1/-1 is harmful. AddCounter, PutCounter, PutCounterAll, and
+        // ForEachCategoryPutCounter share the same semantics — the effect puts
+        // counters of `counter_type` onto a target.
         // MultiplyCounter (e.g., Doubling Season) amplifies existing counters: its
         // polarity is context-dependent (doubling -1/-1 on a creature is harmful).
-        Effect::PutCounter { counter_type, .. } | Effect::PutCounterAll { counter_type, .. } => {
+        Effect::PutCounter { counter_type, .. }
+        | Effect::PutCounterAll { counter_type, .. }
+        | Effect::ForEachCategoryPutCounter { counter_type, .. } => {
             counter_sign_polarity(counter_type)
         }
         // CR 122.1 + CR 121: Removing counters inverts the placement polarity —

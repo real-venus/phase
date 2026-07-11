@@ -606,6 +606,161 @@ fn for_each_category_exile_does_not_shadow_put_to_hand() {
     );
 }
 
+/// CR 105.1 + CR 122.1 + CR 608.2c: the counter-placement category iterator —
+/// "for each color, put a +1/+1 counter on a Dragon you control of that color"
+/// (Call the Spirit Dragons) lowers to
+/// `ForEachCategoryPutCounter { Color, Plus1Plus1, Fixed(1), Typed(Dragon, You) }`.
+#[test]
+fn for_each_color_put_counter_on_dragon_you_control() {
+    use crate::types::ability::{ControllerRef, IterationCategory};
+    let effect =
+        parse_effect("for each color, put a +1/+1 counter on a Dragon you control of that color");
+    match effect {
+        Effect::ForEachCategoryPutCounter {
+            category,
+            counter_type,
+            count,
+            filter,
+        } => {
+            assert_eq!(category, IterationCategory::Color);
+            assert_eq!(counter_type, CounterType::Plus1Plus1);
+            assert_eq!(count, QuantityExpr::Fixed { value: 1 });
+            match filter {
+                TargetFilter::Typed(tf) => {
+                    assert!(
+                        tf.type_filters
+                            .contains(&TypeFilter::Subtype("Dragon".to_string())),
+                        "filter must restrict to Dragons, got {tf:?}"
+                    );
+                    assert_eq!(tf.controller, Some(ControllerRef::You));
+                }
+                other => panic!("expected Typed(Dragon, You) filter, got {other:?}"),
+            }
+        }
+        other => panic!("expected ForEachCategoryPutCounter, got {other:?}"),
+    }
+}
+
+/// CR 608.2c: the trailing "of that color" agreement clause is REQUIRED — a bare
+/// "put a +1/+1 counter on a Dragon you control" with no per-member binding must
+/// NOT lower to the category iterator (it would place one unbound counter, not
+/// one per color). Guards the combinator against over-matching.
+#[test]
+fn for_each_color_put_counter_requires_of_that_color_agreement() {
+    let effect = parse_effect("for each color, put a +1/+1 counter on a Dragon you control");
+    assert!(
+        !matches!(effect, Effect::ForEachCategoryPutCounter { .. }),
+        "without 'of that color' the category iterator must not match, got {effect:?}"
+    );
+}
+
+/// CR 105.1 + CR 104.2b + CR 608.2c: the FULL Call the Spirit Dragons upkeep
+/// trigger body parses to `ForEachCategoryPutCounter` with a `WinTheGame`
+/// sub-ability GATED on `FilteredTrackedSetSize{Dragon} >= 5`. This is the
+/// revert-guard for the win condition: before the fix the sub carried
+/// `condition: None` and won unconditionally every upkeep.
+#[test]
+fn call_the_spirit_dragons_trigger_body_gates_the_win() {
+    use crate::types::ability::{AbilityCondition, Comparator, IterationCategory, QuantityRef};
+    let parsed = parse_oracle_text(
+        "Dragons you control have indestructible.\nAt the beginning of your upkeep, for each color, put a +1/+1 counter on a Dragon you control of that color. If you put +1/+1 counters on five Dragons this way, you win the game.",
+        "Call the Spirit Dragons",
+        &[],
+        &[String::from("Enchantment")],
+        &[],
+    );
+    let execute = parsed
+        .triggers
+        .iter()
+        .find_map(|t| t.execute.as_deref())
+        .expect("upkeep trigger must carry an execute body");
+    assert!(
+        matches!(
+            *execute.effect,
+            Effect::ForEachCategoryPutCounter {
+                category: IterationCategory::Color,
+                ..
+            }
+        ),
+        "trigger effect must be ForEachCategoryPutCounter(Color), got {:?}",
+        execute.effect
+    );
+    let sub = execute
+        .sub_ability
+        .as_deref()
+        .expect("win-the-game sub-ability must be present");
+    assert!(
+        matches!(*sub.effect, Effect::WinTheGame { .. }),
+        "sub effect must be WinTheGame, got {:?}",
+        sub.effect
+    );
+    match sub
+        .condition
+        .as_ref()
+        .expect("the win MUST be gated by a condition (revert guard vs condition: null)")
+    {
+        AbilityCondition::QuantityCheck {
+            lhs:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::FilteredTrackedSetSize { filter, .. },
+                },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value },
+        } => {
+            assert!(
+                matches!(&**filter, TargetFilter::Typed(tf)
+                    if tf.type_filters.contains(&TypeFilter::Subtype("Dragon".to_string()))),
+                "win count must filter Dragons, got {filter:?}"
+            );
+            assert_eq!(*value, 5, "win threshold must be five Dragons");
+        }
+        other => panic!("expected FilteredTrackedSetSize{{Dragon}} >= 5, got {other:?}"),
+    }
+}
+
+/// CR 611.2 + CR 702.12a: clause 1 ("Dragons you control have indestructible")
+/// is unchanged by this work — it stays a Continuous static granting
+/// `AddKeyword(Indestructible)` to Dragons the controller controls.
+#[test]
+fn call_the_spirit_dragons_indestructible_static_unchanged() {
+    use crate::types::ability::{ContinuousModification, ControllerRef};
+    use crate::types::keywords::Keyword;
+    use crate::types::statics::StaticMode;
+    let parsed = parse_oracle_text(
+        "Dragons you control have indestructible.\nAt the beginning of your upkeep, for each color, put a +1/+1 counter on a Dragon you control of that color. If you put +1/+1 counters on five Dragons this way, you win the game.",
+        "Call the Spirit Dragons",
+        &[],
+        &[String::from("Enchantment")],
+        &[],
+    );
+    let indestructible = parsed
+        .statics
+        .iter()
+        .find(|s| {
+            s.mode == StaticMode::Continuous
+                && s.modifications
+                    .contains(&ContinuousModification::AddKeyword {
+                        keyword: Keyword::Indestructible,
+                    })
+        })
+        .expect("clause 1 must stay a Continuous AddKeyword(Indestructible) static");
+    match indestructible
+        .affected
+        .as_ref()
+        .expect("static must name affected Dragons")
+    {
+        TargetFilter::Typed(tf) => {
+            assert!(
+                tf.type_filters
+                    .contains(&TypeFilter::Subtype("Dragon".to_string())),
+                "indestructible must apply to Dragons, got {tf:?}"
+            );
+            assert_eq!(tf.controller, Some(ControllerRef::You));
+        }
+        other => panic!("expected Typed(Dragon, You) affected filter, got {other:?}"),
+    }
+}
+
 /// CR 601.2c: the single-group form ("up to two target creatures you control
 /// each deal damage equal to their power …") has no "and … other target" second
 /// group, so it must lower to the `EachTarget` source picker, not `Unimplemented`.
